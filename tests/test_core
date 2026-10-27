@@ -1,0 +1,173 @@
+import pytest
+
+from core import analyzer, db, grader, law_search
+from core import question_bank as qb
+from core.config import SUBJECTS
+
+
+@pytest.fixture
+def temp_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+
+
+def _attempt(q, correct):
+    return {"question_id": q["id"], "subject": q["subject"], "unit": q["unit"], "is_correct": int(correct), "chosen": 1}
+
+
+# ---------------------------------------------------------------- 데이터 무결성
+
+def test_questions_are_valid():
+    questions = qb.load_questions()
+    ids = [q["id"] for q in questions]
+    assert len(ids) == len(set(ids))
+    law_ids = {law["id"] for law in law_search.load_laws()}
+    for q in questions:
+        assert q["subject"] in SUBJECTS
+        assert 1 <= q["answer"] <= len(q["choices"])
+        assert q["difficulty"] in {"하", "중", "상"}
+        assert set(q["law_refs"]) <= law_ids
+    assert {q["subject"] for q in questions} == set(SUBJECTS)
+
+
+def test_filter_questions():
+    subject = SUBJECTS[0]
+    result = qb.filter_questions(subjects=[subject], difficulties=["하"])
+    assert result and all(q["subject"] == subject and q["difficulty"] == "하" for q in result)
+    assert len(qb.filter_questions()) == len(qb.load_questions())
+
+
+# ---------------------------------------------------------------- 채점
+
+def test_summarize_pass_and_fail():
+    questions = [q for q in qb.load_questions() if q["subject"] in SUBJECTS[:2]]
+    all_correct = {q["id"]: q["answer"] for q in questions}
+    result = grader.summarize(questions, all_correct)
+    assert result.average == 100 and result.passed
+
+    # 1과목만 전부 틀리면 평균은 50점이고 과락으로 불합격
+    answers = {q["id"]: (None if q["subject"] == SUBJECTS[0] else q["answer"]) for q in questions}
+    result = grader.summarize(questions, answers)
+    assert result.subjects[0].score == 0
+    assert not result.passed
+    assert any("과락" in r for r in result.fail_reasons)
+
+
+# ---------------------------------------------------------------- 법령 검색
+
+def test_law_search_prefers_direct_reference():
+    q = qb.get_question("S6-R1-01")
+    laws = law_search.search(q)
+    assert laws[0]["id"] == "L23"
+
+
+# ---------------------------------------------------------------- 분석·추천
+
+def test_weak_unit_detection_uses_recency():
+    q = qb.get_question("S3-R1-02")  # 양중기
+    other = qb.get_question("S2-R1-01")
+    attempts = [_attempt(q, True), _attempt(q, False), _attempt(q, False), _attempt(other, True), _attempt(other, True)]
+    stats = analyzer.unit_stats(attempts)
+    top = stats.iloc[0]
+    assert top["unit"] == "양중기" and top["is_weak"]
+    assert "연속 오답" in top["diagnosis"]
+    assert not stats[stats["unit"] == other["unit"]]["is_weak"].any()
+
+
+def test_recommend_prioritizes_wrong_and_weak_units():
+    questions = list(qb.load_questions())
+    q = qb.get_question("S3-R1-02")
+    attempts = [_attempt(q, False), _attempt(q, False), _attempt(q, False)]
+    recs = analyzer.recommend(attempts, questions, size=10, seed=0)
+    ids = [r[0]["id"] for r in recs]
+    assert len(ids) == 10 and len(set(ids)) == 10
+    assert ids[0] == q["id"]
+    assert any(r[0]["unit"] == "양중기" and "취약 단원" in r[1] for r in recs[1:])
+
+
+def test_recommend_without_history():
+    recs = analyzer.recommend([], list(qb.load_questions()), size=5, seed=1)
+    assert len(recs) == 5
+
+
+# ---------------------------------------------------------------- DB
+
+def test_db_roundtrip(temp_db):
+    q = qb.get_question("S1-R1-01")
+    sid = db.create_session("practice")
+    db.record_attempt(sid, q, 1, False, 12.3)
+    db.finish_session(sid, 1, 0, 0.0, False)
+    attempts = db.fetch_attempts()
+    assert attempts[0]["question_id"] == q["id"] and attempts[0]["is_correct"] == 0
+    assert db.fetch_sessions()[0]["total"] == 1
+
+    db.save_explanation(q["id"], 1, "해설", "claude-opus-5-5")
+    assert db.get_explanation(q["id"], 1) == "해설"
+    db.reset_history()
+    assert db.fetch_attempts() == []
+    assert db.get_explanation(q["id"], 1) == "해설"
+
+
+# ---------------------------------------------------------------- 분석용 기록 거르기 (미응답·지워진 문제)
+
+def test_usable_attempts_excludes_unanswered_and_unknown():
+    questions = list(qb.load_questions())
+    q = qb.get_question("S1-R1-01")
+    attempts = [
+        {**_attempt(q, False), "chosen": None},  # 모의고사 미응답
+        {**_attempt(q, False), "question_id": "DELETED-01"},  # 지워진 문제
+        _attempt(q, True),
+    ]
+    usable = analyzer.usable_attempts(attempts, questions)
+    assert len(usable) == 1 and usable[0]["question_id"] == q["id"]
+
+
+def test_answer_positions_are_balanced():
+    counts = [sum(q["answer"] == n for q in qb.load_questions()) for n in range(1, 5)]
+    assert max(counts) - min(counts) <= 4, counts
+
+
+# ---------------------------------------------------------------- 진행 상태 저장·세션 정리
+
+def test_session_state_save_load_and_delete(temp_db):
+    sid = db.create_session("exam")
+    db.save_session_state(sid, '{"x": 1}')
+    assert db.load_unfinished_state() == (sid, '{"x": 1}')
+    db.finish_session(sid, 0, 0, 0.0, False)
+    assert db.load_unfinished_state() is None  # 종료되면 복원 대상이 아니다
+    sid2 = db.create_session("practice")
+    db.delete_session(sid2)
+    assert sid2 not in db.unfinished_session_ids()
+
+
+def test_init_db_migrates_old_schema(tmp_path, monkeypatch):
+    import sqlite3
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, started_at TEXT NOT NULL,"
+                     " finished_at TEXT, total INTEGER, correct INTEGER, average REAL, passed INTEGER)")
+    monkeypatch.setattr(db, "DB_PATH", path)
+    db.init_db()
+    sid = db.create_session("practice")
+    db.save_session_state(sid, "{}")
+    assert db.load_unfinished_state() == (sid, "{}")
+
+
+def test_close_unfinished_sessions(temp_db):
+    from ui import session
+    q = qb.get_question("S1-R1-01")
+    empty = db.create_session("exam")
+    with_record = db.create_session("practice")
+    db.record_attempt(with_record, q, q["answer"], True, 5)
+    session.close_unfinished_sessions()
+    assert db.unfinished_session_ids() == []
+    finished = {s["id"]: s for s in db.fetch_sessions()}
+    assert empty not in finished and finished[with_record]["correct"] == 1
+
+
+def test_elapsed_is_capped():
+    """B9: 자리를 비운 시간이 소요 시간을 왜곡하지 않도록 상한을 둔다."""
+    from ui import session
+    assert session.capped_elapsed(42.0) == 42.0
+    assert session.capped_elapsed(3600.0) == session.MAX_ELAPSED_SEC
+    assert session.capped_elapsed(-1.0) == 0.0
